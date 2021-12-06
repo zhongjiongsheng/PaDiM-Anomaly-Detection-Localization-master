@@ -40,31 +40,41 @@ def parse_args():
 def main():
 
     args = parse_args()
-
+    # 网络架构修改为resnet18，降低内存开销运行测试
+    args.arch = 'resnet18'
+    
     # load model
     if args.arch == 'resnet18':
-        model = resnet18(pretrained=True, progress=True)
-        t_d = 448
-        d = 100
+        model = resnet18(pretrained=True, progress=True) # 这里会下载到预训练网络模型，文件似乎是*.pth
+        t_d = 448 # resnet18 前三个layer的channels数的和
+        d = 100 # 使用resnet18时，对448维的embedding vector，随机选取出100维，以降低计算量，文章表示这对检测精度的损失比较小，很划算
+        # d = 448 # 实测中，将d改为448之后，在grid和screw上有提升，整体也有提升。
     elif args.arch == 'wide_resnet50_2':
         model = wide_resnet50_2(pretrained=True, progress=True)
         t_d = 1792
         d = 550
     model.to(device)
-    model.eval()
-    random.seed(1024)
+    model.eval() # 进入推理状态
+    random.seed(1024) # 设定生成随机数的随机种子
     torch.manual_seed(1024)
     if use_cuda:
         torch.cuda.manual_seed_all(1024)
 
+    # 随机生成100维的tensor，值从0-447之间随机选择，这里实际上是embedding vector的下标，用以embedding降维的时候选出目标的100维（resnet18）
     idx = torch.tensor(sample(range(0, t_d), d))
 
     # set model's intermediate outputs
     outputs = []
 
+    # 这里声明的hook，就将对应层的output，连接到数组当中。
+    # 基本上，最后output会有3个元素，每个元素是一个activation map，对应输入不同语义空间的描述
     def hook(module, input, output):
         outputs.append(output)
 
+    # 看起来这步是将模型前三层的vector给钩出来（hook：钩）。
+    # 查看register_forward_hook定义可知，传入的hook是一个触发调用的函数。
+    # 注册了前向传播的hook后，对应layer的前向传播完成后，就会触发一次hook
+    # hook的定义必须为：hook(module, input, output)，内容主要是改变output，也可以改变module，但是因为前向传播已完成，修改了不起作用。
     model.layer1[-1].register_forward_hook(hook)
     model.layer2[-1].register_forward_hook(hook)
     model.layer3[-1].register_forward_hook(hook)
@@ -92,6 +102,7 @@ def main():
         if not os.path.exists(train_feature_filepath):
             for (x, _, _) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
                 # model prediction
+                # 将测试图片丢给预训练模型做预测，输出不需要，因此用_，预测的目的是提取其前三层的feature map
                 with torch.no_grad():
                     _ = model(x.to(device))
                 # get intermediate layer outputs
@@ -107,14 +118,18 @@ def main():
             for layer_name in ['layer2', 'layer3']:
                 embedding_vectors = embedding_concat(embedding_vectors, train_outputs[layer_name])
 
-            # randomly select d dimension
+            # randomly select d dimension 文章提及的随机选取idx个维度，idx原文为100
+            # 原文为：randomly reducing
+            # the embedding vector size to only 100 dimensions has a
+            # very little impact on the anomaly localization performance
+            # 448维的feature map中，可能有学到大量重复的map（也就是不同维的map的值，很接近），随机选取100维之后，计算结果不差
             embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
-            # calculate multivariate Gaussian distribution
+            # calculate multivariate Gaussian distribution 计算多变量高斯分布
             B, C, H, W = embedding_vectors.size()
             embedding_vectors = embedding_vectors.view(B, C, H * W)
             mean = torch.mean(embedding_vectors, dim=0).numpy()
             cov = torch.zeros(C, C, H * W).numpy()
-            I = np.identity(C)
+            I = np.identity(C) # 主对角线为1，其余元素为0的方阵
             for i in range(H * W):
                 # cov[:, :, i] = LedoitWolf().fit(embedding_vectors[:, :, i].numpy()).covariance_
                 cov[:, :, i] = np.cov(embedding_vectors[:, :, i].numpy(), rowvar=False) + 0.01 * I
@@ -131,7 +146,9 @@ def main():
         gt_mask_list = []
         test_imgs = []
 
-        # extract test set features
+        # extract test set features 提取测试集特征
+        # 由于是一个batch一个batch提取出来做运算，因此每次都是32个图，对应32个embedding vector
+        # 以bottle数据集为例，几个类型缺陷是：20+22+21+20=83个，因此应该分三次取完，分别是：32 32 19
         for (x, y, mask) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
             test_imgs.extend(x.cpu().detach().numpy())
             gt_list.extend(y.cpu().detach().numpy())
@@ -148,14 +165,18 @@ def main():
             test_outputs[k] = torch.cat(v, 0)
         
         # Embedding concat
+        # 同理将测试集也嵌入到embedding vector中，否则无法与正常样本做比较
+        # Embedding concat 特征聚合，将三个layer的特征矩阵连接在一起
+        # 以layer1和layer2为例，将layer1，按layer2的分辨率H2*W2进行分块，
+        # 然后layer1的一块H2*W2的map（例如：最左上角的一块patch），将layer2里面的（0,0）位置的map值按H2*W2进行复制之后，再跟layer1连接起来
         embedding_vectors = test_outputs['layer1']
         for layer_name in ['layer2', 'layer3']:
-            embedding_vectors = embedding_concat(embedding_vectors, test_outputs[layer_name])
+            embedding_vectors = embedding_concat(embedding_vectors, test_outputs[layer_name]) # 这里三个embedding的分辨率是不一样的，在函数里面做了对齐和连接，过程还挺麻烦
 
         # randomly select d dimension
         embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
         
-        # calculate distance matrix
+        # calculate distance matrix 计算马氏距离
         B, C, H, W = embedding_vectors.size()
         embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()
         dist_list = []
@@ -282,15 +303,17 @@ def denormalization(x):
     
     return x
 
-
+# 参考https://blog.csdn.net/qq_34914551/article/details/102940368的说明
 def embedding_concat(x, y):
     B, C1, H1, W1 = x.size()
-    _, C2, H2, W2 = y.size()
-    s = int(H1 / H2)
+    _, C2, H2, W2 = y.size() # 实际上batch跟x的是一样的，用不上，直接用_接收并丢弃不用
+    s = int(H1 / H2) # 两次进来算得的步幅都是2，因为是从56*56->28*28->14*14这样分辨率下降
     x = F.unfold(x, kernel_size=s, dilation=1, stride=s)
     x = x.view(B, C1, -1, H2, W2)
     z = torch.zeros(B, C1 + C2, x.size(2), H2, W2)
     for i in range(x.size(2)):
+        # 在1维处，把数据添加进去。每次都把整个y（H2*W2）与x划出来的（H2*W2）直接连接起来
+        # 不是我一开始理解的，讲y所在层的map也等比例划分后才连接进去
         z[:, :, i, :, :] = torch.cat((x[:, :, i, :, :], y), 1)
     z = z.view(B, -1, H2 * W2)
     z = F.fold(z, kernel_size=s, output_size=(H1, W1), stride=s)
